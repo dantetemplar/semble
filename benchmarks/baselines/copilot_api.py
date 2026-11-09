@@ -32,7 +32,7 @@ class ProtocolError(ValueError):
 
 
 class CopilotAPI:
-    """Use gh's HTTP stack, with bounded read retries and shared rate-limit guards."""
+    """Use gh's HTTP stack, bounded safe retries and shared rate-limit guards."""
 
     def __init__(self, token: str, request_interval: float = 0.5) -> None:
         """Initialize the transport and cross-worker admission/rate-limit guards."""
@@ -83,7 +83,10 @@ class CopilotAPI:
         if ((is_search and self.search_limited.is_set()) or (is_index and self.index_limited.is_set())
                 or (is_ingest and self.ingest_limited.is_set())):
             raise APIError(429, "Further requests paused after a rate limit; resume later")
-        attempts = 3 if method == "GET" or is_search else 1
+        # A document upload is idempotent for the same ingest_id/doc_id/content.
+        # Do not apply this to snapshot creation or index triggers.
+        is_document = method == "POST" and path == "/external/code/ingest/document"
+        attempts = 3 if method == "GET" or is_search or is_document else 1
         for attempt in range(attempts):
             try:
                 return self._once(method, path, body)

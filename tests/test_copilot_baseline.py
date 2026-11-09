@@ -114,6 +114,23 @@ def test_transient_reads_retry_but_index_triggers_do_not(monkeypatch):
     assert once.call_count == 1
 
 
+def test_document_upload_retries_identical_payload_after_network_failure(monkeypatch):
+    """Retry only the same content-addressed document, never a new ingest/snapshot."""
+    monkeypatch.setattr(copilot.time, "sleep", Mock())
+    api = copilot.CopilotAPI("test-secret")
+    once = Mock(side_effect=[ConnectionError("TLS handshake timeout"), {}])
+    monkeypatch.setattr(api, "_once", once)
+    body = {"ingest_id": "owned-ingest", "doc_id": "pinned-hash", "file_path": "src/a.py", "content": "YQ=="}
+    assert api.request("POST", "/external/code/ingest/document", body) == {}
+    assert once.call_count == 2
+    assert once.call_args_list[0] == once.call_args_list[1]
+    once = Mock(side_effect=ConnectionError("lost response"))
+    monkeypatch.setattr(api, "_once", once)
+    with pytest.raises(ConnectionError):
+        api.request("POST", "/external/code/ingest", {"fileset_name": "owned"})
+    assert once.call_count == 1
+
+
 def test_index_quota_does_not_block_already_ready_repositories(monkeypatch):
     """Do not hammer index triggers, but permit reads and searches of ready indexes."""
     api = copilot.CopilotAPI("test-secret")
