@@ -8,6 +8,7 @@ Quality and speed benchmarks for `semble`.
 - [Ablations](#ablations)
 - [Dataset](#dataset)
 - [Methods](#methods)
+- [Copilot external baseline](#copilot-external-baseline)
 - [Excluded methods](#excluded-methods)
 - [Running the benchmarks](#running-the-benchmarks)
 
@@ -149,6 +150,114 @@ NDCG@10 per language, sorted by semble. CRE = CodeRankEmbed, cbm = codebase-memo
 - **[zvec-grep](https://github.com/zvec-ai/zvec-grep)**: [potion-code-16M-v2](https://huggingface.co/minishlab/potion-code-16M-v2) static embeddings + BM25. Benchmarked in `direct` mode.
 - **[CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed)**: 137M-param transformer embedding model for code retrieval, used for semantic-only dense search.
 - **[semble](https://github.com/your-repo/semble)**: this library. [potion-code-16M-v2](https://huggingface.co/minishlab/potion-code-16M-v2) static embeddings + BM25 + the semble reranking stack.
+
+## Copilot external baseline
+
+`benchmarks.baselines.copilot` is an **opt-in external-service baseline** using the
+same `repos.json`, 1251 annotation queries, `file_rank`, and `ndcg_at_k` as the
+file-level baselines (such as probe). It does not need local checkouts unless using
+the diff overlay. It is not part of the CPU-only leaderboard above, and it does
+not use an LLM to rewrite queries. Tokens are read only from `GH_TOKEN` and never
+stored in results or passed in subprocess arguments. Requires GitHub CLI `gh` and
+Copilot access; the internal API is undocumented and can change.
+
+Three explicitly distinct protocols are available:
+
+- **`exact` (default):** accept an upstream index only when its actual SHA matches
+  the pinned revision. Otherwise record an availability/protocol error, not an
+  observed retrieval miss. This mode does not create forks or force old revisions
+  onto upstream repositories.
+- **`remote-index`:** run the original queries on the currently indexed upstream
+  snapshots, recording every actual SHA and whether it matches the pinned one.
+  Report separately: historical annotations, corpus filters and source contents
+  may differ. A returned `ref_name` or HTTP 200 is not proof of revision selection;
+  see [revision-selector experiments](copilot-revision-selection.md).
+- **`overlay`:** use the existing upstream index plus an external-ingest snapshot
+  of the Git diff at the **pinned revision**. Changed/deleted remote files are
+  excluded. Unchanged hits require identical pinned Git blobs; changed files are
+  retrieved using the same Metis model from an owned fileset/checkpoint. Both
+  candidate sets are merged by descending score, capped to the chunk budget, then
+  filtered at `0.65 * top_score`, following the inspected VS Code path. No local
+  BM25/embedding proxy or silent stale-HEAD fallback is substituted.
+
+```bash
+# Deliberate authentication and network opt-in; do not commit token values.
+export GH_TOKEN="$(gh auth token)"
+
+# Strict pinned-revision results (mismatching upstream indexes are errors).
+uv run python -m benchmarks.baselines.copilot --include-copilot \
+  --repo httpx --output /tmp/copilot-exact.json
+
+# Full annotation suite, explicitly using the existing remote snapshots.
+uv run python -m benchmarks.baselines.copilot --include-copilot \
+  --revision-policy remote-index --index-missing \
+  --output benchmarks/results/copilot-remote-index.json
+
+# Optional: official GitHub WASM hashing/reconciliation utility, pinned to 0.3.0.
+npm ci --prefix benchmarks/copilot_ingest --ignore-scripts
+
+# Upload only public benchmark diff files; use existing indexes, not new forks.
+uv run python -m benchmarks.baselines.copilot --include-copilot \
+  --revision-policy overlay --upload-diff --workers 1 \
+  --output benchmarks/results/copilot-overlay.json
+```
+
+`--repo` / `--language` use the shared annotation filters. `--index-missing`
+separately opts in to triggering absent upstream indexes; `--index-timeout` bounds
+waiting. Safe requests have bounded retries; rate limits stop further requests of
+the affected type, without changing identities or evicting workspace data.
+
+The default returned candidate budget is **30 chunks** before file deduplication,
+as in probe's 3x over-fetch for top-10 files. `benchmark_root` is post-filtered
+because the remote endpoint has no verified path/revision selector. This can
+underfill top-10 and does not reproduce a local restricted-corpus index. Overlay
+mode has up to 30 candidates **per source**, then retains up to 30 merged chunks
+before file deduplication. These are different retrieval pipelines, not an
+ablation that isolates the effect of correcting revisions.
+
+**Scope and safety of the overlay:** public repositories only, pinned regular Git
+blobs only, official ingest eligibility filtering, no arbitrary workspace files.
+Git objects live in `~/.cache/semble-copilot/git/`, without modifying other
+checkouts. The 2000-file / 70% diff guards use whole-repository tracked-file
+counts; this is not VS Code's configurable workspace-ignore denominator. Oversized
+diffs and a 64 MiB content budget are explicit errors. Each run creates UUID-named
+external filesets and deletes only its own filesets, including cleanup after a
+lost create response. Ownership events are recorded in
+`~/.cache/semble-copilot/owned-filesets.jsonl`; cleanup failures retain the owned
+name in the report/journal for manual recovery. Existing user/IDE filesets are
+never deleted to make room. No benchmark-repository forks are needed.
+
+The overlay reproduces the inspected **diff-ingest + same-model merge** path,
+not every IDE feature: optional LLM reranking, workspace settings, timeouts and
+full-workspace fallbacks are not reproduced. Source:
+[VS Code `CodeSearchChunkSearch`](https://github.com/microsoft/vscode/blob/00806ec273c665ede838f2f92f2c6b3fd007cb97/extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/codeSearchChunkSearch.ts)
+and [`rerankChunks`](https://github.com/microsoft/vscode/blob/00806ec273c665ede838f2f92f2c6b3fd007cb97/extensions/copilot/src/platform/workspaceChunkSearch/node/workspaceChunkSearchService.ts#L551-L615).
+
+**Results and resume:** `--output` checkpoints after each query and resumes only
+matching annotation/spec/scoring fingerprints. Successful complete repos are
+retained; partial repos reuse queries only for the same index SHA and overlay
+checkpoint. SHA/model/repository are checked on every hit, with another index
+check after each repo; external hits also require the expected fileset,
+checkpoint, document ID and path. Unavailable queries have explicit errors.
+`summary` reports successes, errors and pending queries, successful-query micro
+NDCG@10, complete-repo macro NDCG@10 (`avg_ndcg10`), and a separate end-to-end score
+that counts unavailable queries as zero. `exact_revision_subset` isolates matching
+remote revisions. Never present a conditional partial mean as the full-suite
+result. `pinned_corpus_subset` additionally includes successfully corrected overlay
+corpora; this does not mean their remote index itself was pinned. File-level scoring
+ignores annotation spans just like probe; it is not
+the span-aware chunk metric of `benchmarks.run_benchmark`.
+
+Latency includes CLI/network/retry overhead, not just server compute. Overlay
+latency includes both searches and admission delay; preparation/upload timing is
+separate. Zero index wait means an index was already available, **not** zero
+construction time. Default latency repeats = 1 to avoid unnecessary remote calls.
+
+Offline tests (no token, network, Node installation or model downloads needed):
+
+```bash
+uv run --extra dev python -m pytest tests/test_copilot_baseline.py tests/test_copilot_overlay.py --no-cov
+```
 
 ## Excluded methods
 

@@ -1,0 +1,8 @@
+{
+  "name": "semble-benchmark-copilot-ingest",
+  "private": true,
+  "description": "Optional official GitHub ingestion utilities for the Copilot diff-overlay benchmark",
+  "dependencies": {
+    "@github/blackbird-external-ingest-utils": "0.3.0"
+  }
+}
