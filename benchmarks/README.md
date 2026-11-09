@@ -161,6 +161,9 @@ not use an LLM to rewrite queries. Tokens are read only from `GH_TOKEN` and neve
 stored in results or passed in subprocess arguments. Requires GitHub CLI `gh` and
 Copilot access; the internal API is undocumented and can change.
 
+[Observed results and caveats](copilot-results.md): the full remote-index run
+completed 1251/1251 queries; the full pinned overlay is still in progress.
+
 Three explicitly distinct protocols are available:
 
 - **`exact` (default):** accept an upstream index only when its actual SHA matches
